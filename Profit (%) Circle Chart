@@ -1,0 +1,63 @@
+WITH fees AS (
+    SELECT
+        DATE_TRUNC('{{Select Date Granularity}}', day) AS month,
+        name,
+        SUM(data_fee_usd) AS l1_calldata_cost_usd,
+        SUM(verification_fee_usd) AS l1_verify_cost_usd,
+        SUM(blob_fee_usd) AS l1_blob_fees,  -- Blob fees included as other fees
+        SUM(l1_fee_usd) AS l1_total_fee_usd
+    FROM rollup_economics_ethereum.l1_fees
+    WHERE day >= CURRENT_DATE - INTERVAL '{{Select Timeframe}}' day
+    and name IN ('base', 'arbitrum', 'zksync era', 'scroll', 'mantle', 'linea', 'blast', 'op mainnet', 'zora')
+    GROUP BY 1, 2
+)
+
+,rev AS (
+    SELECT
+        DATE_TRUNC('{{Select Date Granularity}}', day) AS month,
+        name,
+        SUM(l2_rev_usd) AS l2_rev_usd
+    FROM rollup_economics_ethereum.l2_revenue
+    WHERE day >= CURRENT_DATE - INTERVAL '{{Select Timeframe}}' day
+    and name IN ('base', 'arbitrum', 'zksync era', 'scroll', 'mantle', 'linea', 'blast', 'op mainnet', 'zora')
+
+    GROUP BY 1, 2
+)
+
+,calc AS (
+    SELECT
+        f.month,
+        f.name,  -- Include chain name in the select statement
+        -f.l1_calldata_cost_usd AS l1_calldata_cost_usd,
+        -f.l1_verify_cost_usd AS l1_verify_cost_usd,
+        -f.l1_blob_fees AS l1_blob_fees,
+        COALESCE(r.l2_rev_usd, 0) AS l2_rev_usd,
+        CASE 
+            WHEN r.l2_rev_usd IS NOT NULL THEN r.l2_rev_usd - f.l1_calldata_cost_usd - f.l1_verify_cost_usd - f.l1_blob_fees
+            ELSE 0
+        END AS margin_usd
+    FROM fees f
+    LEFT JOIN rev r ON (f.month = r.month AND f.name = r.name)
+)
+
+SELECT
+    c.month,
+    c.name,  -- Include chain name in the final result
+    c.l1_calldata_cost_usd,
+    c.l1_verify_cost_usd,
+    c.l1_blob_fees,
+    - (c.l1_calldata_cost_usd + c.l1_verify_cost_usd + c.l1_blob_fees) as l1_costs_usd,
+    c.l2_rev_usd,
+    c.margin_usd,
+    SUM(c.l1_calldata_cost_usd) OVER (PARTITION BY c.name ORDER BY c.month) AS cumulative_l1_calldata_cost_usd,
+    SUM(c.l1_verify_cost_usd) OVER (PARTITION BY c.name ORDER BY c.month) AS cumulative_l1_verify_cost_usd,
+    SUM(c.l1_blob_fees) OVER (PARTITION BY c.name ORDER BY c.month) AS cumulative_l1_blob_fees,
+    SUM(c.l2_rev_usd) OVER (PARTITION BY c.name ORDER BY c.month) AS cumulative_l2_rev_usd,
+    SUM(c.margin_usd) OVER (PARTITION BY c.name ORDER BY c.month) AS cumulative_margin_usd,
+    CASE 
+        WHEN SUM(c.l2_rev_usd) OVER (PARTITION BY c.name ORDER BY c.month) != 0 THEN 
+            (SUM(c.margin_usd) OVER (PARTITION BY c.name ORDER BY c.month) / SUM(c.l2_rev_usd) OVER (PARTITION BY c.name ORDER BY c.month)) * 100
+        ELSE 0
+    END AS cumulative_margin_percentage
+FROM calc c
+ORDER BY c.name, c.month DESC;
